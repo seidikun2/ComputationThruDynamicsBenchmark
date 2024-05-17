@@ -1,6 +1,6 @@
 # Class to generate training data for task-trained RNN that does 3 bit memory task
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional, Union
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -354,7 +354,7 @@ class RandomTarget(Environment):
         """
         self.goal = goal
 
-    def get_obs(self, action=None, deterministic: bool = False) -> Tensor | ndarray:
+    def get_obs(self, action=None, deterministic: bool = False) -> Union[Tensor, ndarray]:
         self.update_obs_buffer(action=action)
 
         obs_as_list = [
@@ -372,8 +372,8 @@ class RandomTarget(Environment):
     def reset(
         self,
         batch_size: int = 1,
-        options: dict[str, Any] | None = None,
-        seed: int | None = None,
+        options: Optional[dict[str, Any]] = None,
+        seed: Optional[int] = None,
     ) -> tuple[Any, dict[str, Any]]:
 
         """
