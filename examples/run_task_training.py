@@ -3,6 +3,9 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+import sys
+# adiciona a raiz do repo ao sys.path
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import dotenv
 import ray
@@ -23,7 +26,7 @@ dotenv.load_dotenv(override=True)
 # ---------------Options---------------
 LOCAL_MODE = True  # Set to True to run locally (for debugging)
 OVERWRITE = True  # Set to True to overwrite existing run
-WANDB_LOGGING = True  # Set to True to log to WandB (need an account)
+WANDB_LOGGING = False  # Set to True to log to WandB (need an account)
 
 RUN_DESC = "NBFF_NoisyGRU_TorchTest"  # For WandB and run dir
 TASK = "NBFF"  # Task to train on (see configs/task_env for options)
@@ -53,7 +56,7 @@ SEARCH_SPACE = dict(
 
 # ------------------Data Management Variables --------------------------------
 
-HOME_DIR = Path(os.environ.get("HOME_DIR"))
+HOME_DIR = Path(os.environ.get("HOME_DIR") or Path.home())
 print(f"Saving files to {HOME_DIR}")
 
 path_dict = dict(
@@ -113,10 +116,10 @@ def main(
         metric="loss",
         mode="min",
         config=SEARCH_SPACE,
-        resources_per_trial=dict(cpu=8, gpu=0.9),
+        resources_per_trial=dict(cpu=8, gpu=0.0),
         num_samples=1,
         storage_path=str(RUN_DIR),
-        search_alg=BasicVariantGenerator(),
+        search_alg=BasicVariantGenerator(a),
         scheduler=FIFOScheduler(),
         verbose=1,
         progress_reporter=CLIReporter(

@@ -1,6 +1,6 @@
 # Class to generate training data for task-trained RNN that does 3 bit memory task
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, Sequence
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -13,6 +13,9 @@ from numpy import ndarray
 from torch._tensor import Tensor
 
 from ctd.task_modeling.task_env.loss_func import NBFFLoss, RandomTargetLoss
+
+import json
+from pathlib import Path
 
 
 class DecoupledEnvironment(gym.Env, ABC):
@@ -441,3 +444,286 @@ class RandomTarget(Environment):
             "goal": self.goal if self.differentiable else self.detach(self.goal),
         }
         return obs, info
+
+# ============================================================
+# MazeWorld2D: ambiente acoplado com colisões retangulares
+# - estado: XY
+# - ação do modelo: velocidade XY (ou delta XY)
+# - step aplica integração + colisão com barreiras AABB
+# - lê mazes.json + traj_means.npz exportados
+# Compatível com TaskTrainedWrapper (coupled_env=True)
+# ============================================================
+# ============================================================
+# MazeWorld2D (corrigido): alinhamento por interpolação,
+# maze/versão fixos por episódio e step determinístico.
+# ============================================================
+
+class MazeTask:
+    """Ambiente 2D com paredes retangulares (AABB) e alvo XY."""
+
+    def __init__(
+        self,
+        export_dir: Union[str, Path],
+        n_timesteps: int,
+        dt: float = 0.01,
+        speed_limit: float = 100.0,
+        agent_radius: float = 0.0,
+        t_ms: Sequence[int] = np.arange(-50, 451),   # grade desejada, em ms
+        use_maze_ids: Optional[Sequence[int]] = None,
+        use_versions: Optional[Sequence[int]] = None,
+        go_cue_at_zero: bool = True,
+        add_xy_noise: float = 0.0,
+    ):
+        self.dataset_name  = "MazeWorld2D"
+        self.n_timesteps   = int(n_timesteps)
+        self.dt            = float(dt)
+        self.speed_limit   = float(speed_limit)
+        self.agent_radius  = float(agent_radius)
+        self.coupled_env   = True
+        self.state_label   = "xy"
+        self.dynamic_noise = 0.0
+
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
+        self.action_space      = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
+        self.context_inputs    = spaces.Box(low=-np.inf, high=np.inf, shape=(0,), dtype=np.float32)
+
+        self.loss_func = nn.MSELoss()
+
+        export_dir          = Path(export_dir)
+        with open(export_dir / "mazes.json", "r", encoding="utf-8") as f:
+            self.mazes = json.load(f)
+        self.traj_npz       = np.load(export_dir / "traj_means.npz")
+
+        self.use_maze_ids   = set(use_maze_ids) if use_maze_ids is not None else None
+        self.use_versions   = set(use_versions) if use_versions is not None else None
+        self.keys           = self._collect_valid_keys()
+        any_k               = next(iter(self.keys))
+        self.t_ms_export    = self.traj_npz[f"{any_k}_t_ms"].astype(int)
+        self.t_ms           = np.asarray(t_ms, dtype=int)
+        self.go_cue_at_zero = bool(go_cue_at_zero)
+        self.add_xy_noise   = float(add_xy_noise)
+
+        # estado interno
+        self._pos        = None     # (B,2)
+        self._goal       = None     # (B,2)
+        self._rects      = None     # barreiras do maze corrente
+        self._cur_key    = None     # "maze{mid}_ver{ver}"
+        self._terminated = False
+
+        # se n_timesteps não bate com len(t_ms), force T = len(t_ms)
+        if self.n_timesteps != len(self.t_ms):
+            self.n_timesteps = len(self.t_ms)
+
+    # ---------- utils geométricos ----------
+
+    @staticmethod
+    def _clamp_norm(v, maxnorm):
+        n = np.linalg.norm(v, axis=-1, keepdims=True) + 1e-9
+        f = np.minimum(1.0, maxnorm / n)
+        return v * f
+
+    @staticmethod
+    def _rects_from_json(maze_dict):
+        rects = []
+        for cx, cy, hw, hh in maze_dict.get("barriers", []):
+            xmin, xmax = cx - hw, cx + hw
+            ymin, ymax = cy - hh, cy + hh
+            rects.append([xmin, xmax, ymin, ymax])
+        return rects
+
+    def _resolve_collision(self, p, rects):
+        x, y = p
+        for (xmin, xmax, ymin, ymax) in rects:
+            if (xmin - self.agent_radius) <= x <= (xmax + self.agent_radius) and \
+               (ymin - self.agent_radius) <= y <= (ymax + self.agent_radius):
+                dx_left  = abs(x - (xmin - self.agent_radius))
+                dx_right = abs((xmax + self.agent_radius) - x)
+                dy_bot   = abs(y - (ymin - self.agent_radius))
+                dy_top   = abs((ymax + self.agent_radius) - y)
+                m = min(dx_left, dx_right, dy_bot, dy_top)
+                if   m == dx_left:  x = xmin - self.agent_radius
+                elif m == dx_right: x = xmax + self.agent_radius
+                elif m == dy_bot:   y = ymin - self.agent_radius
+                else:               y = ymax + self.agent_radius
+        return np.array([x, y], dtype=np.float32)
+
+    def _collect_valid_keys(self):
+        keys = []
+        for k in self.mazes.keys():  # formato "mazeId__version"
+            mid_str, ver_str = k.split("__")
+            mid, ver = int(mid_str), int(ver_str)
+            if (self.use_maze_ids is not None) and (mid not in self.use_maze_ids):
+                continue
+            if (self.use_versions is not None) and (ver not in self.use_versions):
+                continue
+            base = f"maze{mid}_ver{ver}"
+            if (f"{base}_X" in self.traj_npz) and (f"{base}_Y" in self.traj_npz) and (f"{base}_t_ms" in self.traj_npz):
+                keys.append(base)
+        if not keys:
+            raise RuntimeError("Sem chaves válidas no NPZ para os filtros.")
+        return keys
+
+    def _sample_key(self, rng):
+        key = rng.choice(self.keys)
+        mid = int(key.split("_")[0].replace("maze", ""))
+        ver = int(key.split("_")[1].replace("ver", ""))
+        maze_json_key = f"{mid}__{ver}"
+        return key, self.mazes[maze_json_key]
+
+    # ---------- alinhamento de trajetórias ----------
+
+    def _align_traj(self, X_src, Y_src, t_src, t_dst):
+        """Retorna X,Y interpolados em t_dst (mesma length de t_dst)."""
+        X_src = np.asarray(X_src, dtype=np.float32)
+        Y_src = np.asarray(Y_src, dtype=np.float32)
+        t_src = np.asarray(t_src, dtype=np.float32)
+        t_dst = np.asarray(t_dst, dtype=np.float32)
+
+        # interp 1D; para fora do suporte, segura borda
+        x_al = np.interp(t_dst, t_src, X_src, left=X_src[0], right=X_src[-1]).astype(np.float32)
+        y_al = np.interp(t_dst, t_src, Y_src, left=Y_src[0], right=Y_src[-1]).astype(np.float32)
+        return x_al, y_al
+
+    # ---------- API esperada pelo wrapper ----------
+
+    def reset(self, batch_size: int = 1, options: Optional[dict] = None):
+        rng = np.random.default_rng()
+        self._terminated = False
+
+        # escolhe UM maze/versão e guarda para o episódio
+        key, maze_dict = self._sample_key(rng)
+        self._cur_key  = key
+        self._rects    = self._rects_from_json(maze_dict)
+
+        X = self.traj_npz[f"{key}_X"].astype(np.float32)
+        Y = self.traj_npz[f"{key}_Y"].astype(np.float32)
+        t = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
+
+        Xr, Yr = self._align_traj(X, Y, t_src=t, t_dst=self.t_ms)
+
+        p0 = np.array([Xr[0], Yr[0]], dtype=np.float32)
+        p0 = self._resolve_collision(p0, self._rects)
+
+        self._pos  = np.tile(p0[None, :], (batch_size, 1))
+        self._goal = np.tile(np.array([Xr[-1], Yr[-1]], np.float32), (batch_size, 1))
+
+        obs = torch.from_numpy(self._pos).float()
+        info = {"states": {"xy": obs, "joint": None}}
+        return obs, info
+
+    def step(self, action, inputs):
+        a = action.detach().cpu().numpy().astype(np.float32)
+        a = self._clamp_norm(a, self.speed_limit)
+
+        new_pos = self._pos + self.dt * a
+        for b in range(new_pos.shape[0]):
+            new_pos[b, :] = self._resolve_collision(new_pos[b, :], self._rects)
+
+        self._pos = new_pos
+        obs = torch.from_numpy(self._pos).float()
+        terminated = False
+        truncated = False
+        info = {"states": {"xy": obs, "joint": None}}
+        reward = None
+        return obs, reward, terminated, truncated, info
+
+    # ---------- dataset supervisionado ----------
+    def generate_dataset(self, n_samples: int):
+        rng = np.random.default_rng()
+        T = self.n_timesteps
+    
+        # Canais: tx, ty, go, phase_init, phase_target, phase_delay, phase_move, maze_id
+        C = 8
+        inputs  = np.zeros((n_samples, T, C), dtype=np.float32)
+        targets = np.zeros((n_samples, T, 2), dtype=np.float32)
+        ics     = np.zeros((n_samples, 2), dtype=np.float32)
+        conds   = np.zeros((n_samples, 2), dtype=np.int32)   # (maze_id, version)
+        extras  = []
+        # máscaras por fase para inspeção
+        phase_masks = dict(init=[], target=[], delay=[], move=[])
+    
+        # convenção temporal (você já tem self.t_ms, target_on e go_cue)
+        has_zero = int(0 in set(self.t_ms))
+        t = self.t_ms
+    
+        for i in range(n_samples):
+            key, maze_dict = self._sample_key(rng)
+            X = self.traj_npz[f"{key}_X"].astype(np.float32)
+            Y = self.traj_npz[f"{key}_Y"].astype(np.float32)
+            t_src = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
+    
+            Xr, Yr = self._align_traj(X, Y, t_src=t_src, t_dst=t)
+    
+            # sorteios de eventos (reaproveitando a sua lógica anterior)
+            # target_on entre -10 e +40 ms, por exemplo (ajuste ao seu gosto):
+            target_on = rng.integers(low=max(-10, t[0]), high=min(40, t[-1]+1))
+            # go_cue depois de target_on (delay >= 0)
+            go_cue = rng.integers(low=max(target_on, 0), high=t[-1]+1) if has_zero else rng.integers(low=target_on, high=t[-1]+1)
+    
+            # targets = trajetória média
+            targets[i, :, 0] = Xr
+            targets[i, :, 1] = Yr
+    
+            # inputs: tx, ty
+            inputs[i, :, 0] = Xr
+            inputs[i, :, 1] = Yr
+    
+            # go: 1 a partir de go_cue
+            if has_zero:
+                # se 0 ∈ t, “init” é t<0; “target” pode começar em target_on; “move” em go_cue
+                go_mask = (t >= go_cue)
+                init_mask   = (t < 0)
+            else:
+                go_mask = (np.arange(T) >= go_cue)  # fallback por índice
+                init_mask   = np.zeros(T, dtype=bool)
+    
+            inputs[i, go_mask, 2] = 1.0  # go canal
+    
+            # fases (one-hot)
+            target_mask = (t >= target_on) & (t < go_cue)
+            delay_mask  = target_mask      # se quiser separar target_on e delay, faça outro sorteio para "delay_end"
+            move_mask   = (t >= go_cue)
+    
+            # aqui, por simplicidade, "phase_target" e "phase_delay" iguais; se quiser delay separado,
+            # sorteie p.ex. delay_end = go_cue, e defina:
+            #   target_mask = (t >= target_on) & (t < delay_end)
+            #   delay_mask  = (t >= delay_end) & (t < go_cue)
+    
+            inputs[i, init_mask,   3] = 1.0  # phase_init
+            inputs[i, target_mask, 4] = 1.0  # phase_target
+            inputs[i, delay_mask,  5] = 1.0  # phase_delay
+            inputs[i, move_mask,   6] = 1.0  # phase_move
+    
+            # maze_id escalar normalizado (0..1) ou bruto
+            mid = int(key.split("_")[0].replace("maze", ""))
+            ver = int(key.split("_")[1].replace("ver", ""))
+            # normalização simples por max id visto (opcional). Para ser deterministicamente reusável,
+            # use o valor bruto mesmo:
+            inputs[i, :, 7] = float(mid)  # constante no tempo
+    
+            # ics = posição inicial
+            ics[i] = targets[i, 0, :]
+    
+            conds[i] = np.array([mid, ver], dtype=np.int32)
+            extras.append(dict(key=key, target_on=int(target_on), go_cue=int(go_cue)))
+    
+            # guarda máscaras (apenas para depurar/plot)
+            phase_masks["init"].append(init_mask.astype(np.uint8))
+            phase_masks["target"].append(target_mask.astype(np.uint8))
+            phase_masks["delay"].append(delay_mask.astype(np.uint8))
+            phase_masks["move"].append(move_mask.astype(np.uint8))
+    
+        dataset_dict = dict(
+            ics           = ics,
+            inputs        = inputs,                           # [tx,ty,go,init,target,delay,move,maze_id]
+            inputs_to_env = np.zeros((n_samples, T, 0), dtype=np.float32),  # vazio; ambiente cuida das paredes
+            targets       = targets,                          # [x,y]
+            true_inputs   = inputs.copy(),
+            conds         = conds,                            # (maze_id, version)
+            extra         = np.array(extras, dtype=object).reshape(-1, 1),
+            # opcional, útil para análise:
+            phase_dict    = {k: np.asarray(v, dtype=np.uint8) for k, v in phase_masks.items()},
+        )
+        extra_dict = {}
+        return dataset_dict, extra_dict
+    

@@ -1,0 +1,11 @@
+learning_rate: 0.001
+weight_decay: 1.0e-08
+input_size: null
+output_size: null
+task_env: null
+model: null
+data_env: null
+n_samples: 1000
+seed: 0
+batch_size: 1000
+num_workers: 4
