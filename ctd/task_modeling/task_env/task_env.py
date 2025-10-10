@@ -626,104 +626,113 @@ class MazeTask:
         info = {"states": {"xy": obs, "joint": None}}
         reward = None
         return obs, reward, terminated, truncated, info
-
-    # ---------- dataset supervisionado ----------
+    
     def generate_dataset(self, n_samples: int):
         rng = np.random.default_rng()
         T = self.n_timesteps
+        t = self.t_ms  # vetor de tempo (ms) do próprio ambiente, len == T
     
-        # Canais: tx, ty, go, phase_init, phase_target, phase_delay, phase_move, maze_id
+        # Canais: [0]=tx_norm, [1]=ty_norm, [2]=go,
+        #         [3]=phase_init, [4]=phase_target, [5]=phase_delay, [6]=phase_move,
+        #         [7]=maze_id (constante no trial)
         C = 8
         inputs  = np.zeros((n_samples, T, C), dtype=np.float32)
         targets = np.zeros((n_samples, T, 2), dtype=np.float32)
         ics     = np.zeros((n_samples, 2), dtype=np.float32)
-        conds   = np.zeros((n_samples, 2), dtype=np.int32)   # (maze_id, version)
+        conds   = np.zeros((n_samples, 2), dtype=np.int32)   # (maze_id, ver)
         extras  = []
-        # máscaras por fase para inspeção
-        phase_masks = dict(init=[], target=[], delay=[], move=[])
-    
-        # convenção temporal (você já tem self.t_ms, target_on e go_cue)
-        has_zero = int(0 in set(self.t_ms))
-        t = self.t_ms
     
         for i in range(n_samples):
-            key, maze_dict = self._sample_key(rng)
+            # --- escolhe um maze ---
+            key, _maze_dict = self._sample_key(rng)
             X = self.traj_npz[f"{key}_X"].astype(np.float32)
             Y = self.traj_npz[f"{key}_Y"].astype(np.float32)
             t_src = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
     
+            # --- alinha para a grade t ---
             Xr, Yr = self._align_traj(X, Y, t_src=t_src, t_dst=t)
     
-            # sorteios de eventos (reaproveitando a sua lógica anterior)
-            # target_on entre -10 e +40 ms, por exemplo (ajuste ao seu gosto):
-            target_on = rng.integers(low=max(-10, t[0]), high=min(40, t[-1]+1))
-            # go_cue depois de target_on (delay >= 0)
-            go_cue = rng.integers(low=max(target_on, 0), high=t[-1]+1) if has_zero else rng.integers(low=target_on, high=t[-1]+1)
+            # normalização global para os canais de entrada (apenas visual/escala)
+            max_abs = max(1e-6, float(np.nanmax(np.abs(np.stack([Xr, Yr], axis=-1)))))
+            Xn = Xr / max_abs
+            Yn = Yr / max_abs
     
-            # targets = trajetória média
-            targets[i, :, 0] = Xr
-            targets[i, :, 1] = Yr
+            # posições de interesse
+            p0   = np.array([Xr[0],   Yr[0]], dtype=np.float32)     # start
+            p0_n = np.array([Xn[0],   Yn[0]], dtype=np.float32)     # start (norm.)
+            goal = np.array([Xr[-1],  Yr[-1]], dtype=np.float32)    # alvo final
+            goal_n = np.array([Xn[-1], Yn[-1]], dtype=np.float32)
     
-            # inputs: tx, ty
-            inputs[i, :, 0] = Xr
-            inputs[i, :, 1] = Yr
+            # --- agenda das fases (índices, sem overlap) ---
+            # target_on_idx  < delay_end_idx  < go_idx
+            # deixe janelas razoáveis; ajuste os ranges conforme seu t
+            target_on_idx = int(rng.integers(low=max(5, T//10), high=min(T//4, T-200)))
+            delay_len     = int(rng.integers(low=30, high=90))
+            delay_end_idx = min(T-2, target_on_idx + delay_len)
+            go_idx        = delay_end_idx  # go logo após delay (poderia ter outra amostra se quiser)
+            move_idx      = go_idx
     
-            # go: 1 a partir de go_cue
-            if has_zero:
-                # se 0 ∈ t, “init” é t<0; “target” pode começar em target_on; “move” em go_cue
-                go_mask = (t >= go_cue)
-                init_mask   = (t < 0)
-            else:
-                go_mask = (np.arange(T) >= go_cue)  # fallback por índice
-                init_mask   = np.zeros(T, dtype=bool)
+            # --- fases one-hot ---
+            phase_init   = np.zeros(T, np.float32); phase_init[:target_on_idx]     = 1.0
+            phase_target = np.zeros(T, np.float32); phase_target[target_on_idx:delay_end_idx] = 1.0
+            phase_delay  = np.zeros(T, np.float32); phase_delay[delay_end_idx:go_idx]         = 1.0
+            phase_move   = np.zeros(T, np.float32); phase_move[move_idx:]                    = 1.0
     
-            inputs[i, go_mask, 2] = 1.0  # go canal
+            # --- canal go (só na fase move) ---
+            go = np.zeros(T, np.float32); go[move_idx:] = 1.0
     
-            # fases (one-hot)
-            target_mask = (t >= target_on) & (t < go_cue)
-            delay_mask  = target_mask      # se quiser separar target_on e delay, faça outro sorteio para "delay_end"
-            move_mask   = (t >= go_cue)
+            # --- entradas tx,ty por fase ---
+            # INIT   : variáveis da task disponíveis (cursor/start) -> p0
+            # TARGET : alvo visível (goal constante)
+            # DELAY  : continua visível (goal constante)
+            # MOVE   : pode manter goal constante (a rede já deve “seguir” o target via loss)
+            tx = np.zeros(T, np.float32); ty = np.zeros(T, np.float32)
+            tx[phase_init > 0.5]   = p0_n[0];   ty[phase_init > 0.5]   = p0_n[1]
+            tx[phase_target > 0.5] = goal_n[0]; ty[phase_target > 0.5] = goal_n[1]
+            tx[phase_delay > 0.5]  = goal_n[0]; ty[phase_delay > 0.5]  = goal_n[1]
+            tx[phase_move > 0.5]   = goal_n[0]; ty[phase_move > 0.5]   = goal_n[1]
     
-            # aqui, por simplicidade, "phase_target" e "phase_delay" iguais; se quiser delay separado,
-            # sorteie p.ex. delay_end = go_cue, e defina:
-            #   target_mask = (t >= target_on) & (t < delay_end)
-            #   delay_mask  = (t >= delay_end) & (t < go_cue)
+            # --- TARGETS (o que o modelo deve produzir) ---
+            # Sem movimento até o go: manter p0 até go_idx,
+            # depois “tocar” a trajetória do labirinto (Xr, Yr) a partir do início.
+            tgt_xy = np.tile(p0[None, :], (T, 1))  # tudo em p0
+            L = T - move_idx
+            if L > 0:
+                # encaixa a trajetória desde o começo em move_idx...
+                segX = Xr[:L]; segY = Yr[:L]
+                tgt_xy[move_idx:, 0] = segX
+                tgt_xy[move_idx:, 1] = segY
     
-            inputs[i, init_mask,   3] = 1.0  # phase_init
-            inputs[i, target_mask, 4] = 1.0  # phase_target
-            inputs[i, delay_mask,  5] = 1.0  # phase_delay
-            inputs[i, move_mask,   6] = 1.0  # phase_move
+            # --- escreve tensores nos buffers ---
+            inputs[i, :, 0] = tx
+            inputs[i, :, 1] = ty
+            inputs[i, :, 2] = go
+            inputs[i, :, 3] = phase_init
+            inputs[i, :, 4] = phase_target
+            inputs[i, :, 5] = phase_delay
+            inputs[i, :, 6] = phase_move
     
-            # maze_id escalar normalizado (0..1) ou bruto
             mid = int(key.split("_")[0].replace("maze", ""))
             ver = int(key.split("_")[1].replace("ver", ""))
-            # normalização simples por max id visto (opcional). Para ser deterministicamente reusável,
-            # use o valor bruto mesmo:
-            inputs[i, :, 7] = float(mid)  # constante no tempo
+            inputs[i, :, 7] = float(mid)  # opcional (id bruto)
     
-            # ics = posição inicial
-            ics[i] = targets[i, 0, :]
-    
-            conds[i] = np.array([mid, ver], dtype=np.int32)
-            extras.append(dict(key=key, target_on=int(target_on), go_cue=int(go_cue)))
-    
-            # guarda máscaras (apenas para depurar/plot)
-            phase_masks["init"].append(init_mask.astype(np.uint8))
-            phase_masks["target"].append(target_mask.astype(np.uint8))
-            phase_masks["delay"].append(delay_mask.astype(np.uint8))
-            phase_masks["move"].append(move_mask.astype(np.uint8))
+            targets[i] = tgt_xy
+            ics[i]     = p0
+            conds[i]   = np.array([mid, ver], dtype=np.int32)
+            extras.append(dict(key=key,
+                               target_on_idx=int(target_on_idx),
+                               delay_end_idx=int(delay_end_idx),
+                               go_idx=int(go_idx),
+                               max_abs=float(max_abs)))
     
         dataset_dict = dict(
             ics           = ics,
-            inputs        = inputs,                           # [tx,ty,go,init,target,delay,move,maze_id]
-            inputs_to_env = np.zeros((n_samples, T, 0), dtype=np.float32),  # vazio; ambiente cuida das paredes
-            targets       = targets,                          # [x,y]
+            inputs        = inputs,                           # [tx_n,ty_n,go,init,target,delay,move,maze_id]
+            inputs_to_env = np.zeros((n_samples, T, 0), dtype=np.float32),  # paredes ficam no ambiente
+            targets       = targets,                          # [x,y] — sem movimento até go, depois trajetória
             true_inputs   = inputs.copy(),
             conds         = conds,                            # (maze_id, version)
             extra         = np.array(extras, dtype=object).reshape(-1, 1),
-            # opcional, útil para análise:
-            phase_dict    = {k: np.asarray(v, dtype=np.uint8) for k, v in phase_masks.items()},
         )
         extra_dict = {}
         return dataset_dict, extra_dict
-    
