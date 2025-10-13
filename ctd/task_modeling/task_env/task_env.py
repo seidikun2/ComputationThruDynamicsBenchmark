@@ -635,24 +635,29 @@ class MazeTask:
         info = {"states": {"xy": obs, "joint": joint_state}}
         return obs, info
 
-    def step(self, action, inputs, endpoint_load=None, **kwargs):
-        """Integra posição com ação (velocidade XY). `endpoint_load` é aceito (compat wrapper),
-        mas ignorado neste ambiente."""
+
+    def step(self, action, inputs, endpoint_load=None):
+        """
+        action: torch.Tensor (B,2)
+        inputs: torch.Tensor (B,C)  -> canais da task (tx,ty,go,...)
+        endpoint_load: torch.Tensor | None  (B,2)  -> ignorado aqui (não usamos cargas)
+        """
         a = action.detach().cpu().numpy().astype(np.float32)
         a = self._clamp_norm(a, self.speed_limit)
-
+    
         new_pos = self._pos + self.dt * a
         for b in range(new_pos.shape[0]):
             new_pos[b, :] = self._resolve_collision(new_pos[b, :], self._rects)
-
+    
         self._pos = new_pos
         obs = torch.from_numpy(self._pos).float()
-        joint_state = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)  # (B,0)
+        joint_state = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)
         info = {"states": {"xy": obs, "joint": joint_state}}
         reward = None
         terminated = False
         truncated = False
         return obs, reward, terminated, truncated, info
+
 
     def generate_dataset(self, n_samples: int):
         rng = np.random.default_rng()
