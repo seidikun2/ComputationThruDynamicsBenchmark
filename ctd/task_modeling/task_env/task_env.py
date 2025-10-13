@@ -458,7 +458,6 @@ class RandomTarget(Environment):
 # maze/versão fixos por episódio e step determinístico.
 # ============================================================
 
-
 class MazeTask:
     """Ambiente 2D com paredes retangulares (AABB) e alvo XY."""
 
@@ -535,9 +534,23 @@ class MazeTask:
 
     @staticmethod
     def _rects_from_json(maze_dict):
+        """
+        Converte 'barriers' do JSON para AABBs [xmin, xmax, ymin, ymax].
+        Aceita itens como dict {"cx","cy","hw","hh"} (possivelmente strings)
+        ou como lista/tupla [cx, cy, hw, hh].
+        """
         rects = []
-        for cx, cy, hw, hh in maze_dict.get("barriers", []):
-            cx = float(cx); cy = float(cy); hw = float(hw); hh = float(hh)
+        for b in maze_dict.get("barriers", []):
+            if isinstance(b, dict):
+                cx = float(b.get("cx", 0))
+                cy = float(b.get("cy", 0))
+                hw = float(b.get("hw", 0))
+                hh = float(b.get("hh", 0))
+            elif isinstance(b, (list, tuple)) and len(b) >= 4:
+                cx = float(b[0]); cy = float(b[1]); hw = float(b[2]); hh = float(b[3])
+            else:
+                # formato inesperado: ignora
+                continue
             xmin, xmax = cx - hw, cx + hw
             ymin, ymax = cy - hh, cy + hh
             rects.append([xmin, xmax, ymin, ymax])
@@ -622,7 +635,9 @@ class MazeTask:
         info = {"states": {"xy": obs, "joint": joint_state}}
         return obs, info
 
-    def step(self, action, inputs):
+    def step(self, action, inputs, endpoint_load=None, **kwargs):
+        """Integra posição com ação (velocidade XY). `endpoint_load` é aceito (compat wrapper),
+        mas ignorado neste ambiente."""
         a = action.detach().cpu().numpy().astype(np.float32)
         a = self._clamp_norm(a, self.speed_limit)
 
@@ -685,10 +700,10 @@ class MazeTask:
             move_idx      = go_idx
 
             # --- fases one-hot ---
-            phase_init   = np.zeros(T, np.float32); phase_init[:target_on_idx]           = 1.0
+            phase_init   = np.zeros(T, np.float32); phase_init[:target_on_idx]                = 1.0
             phase_target = np.zeros(T, np.float32); phase_target[target_on_idx:delay_end_idx] = 1.0
-            phase_delay  = np.zeros(T, np.float32); phase_delay[delay_end_idx:go_idx]    = 1.0
-            phase_move   = np.zeros(T, np.float32); phase_move[move_idx:]                = 1.0
+            phase_delay  = np.zeros(T, np.float32); phase_delay[delay_end_idx:go_idx]         = 1.0
+            phase_move   = np.zeros(T, np.float32); phase_move[move_idx:]                     = 1.0
 
             # --- canal go ---
             go = np.zeros(T, np.float32); go[move_idx:] = 1.0
