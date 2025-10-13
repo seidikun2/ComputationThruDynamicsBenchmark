@@ -458,6 +458,7 @@ class RandomTarget(Environment):
 # maze/versão fixos por episódio e step determinístico.
 # ============================================================
 
+
 class MazeTask:
     """Ambiente 2D com paredes retangulares (AABB) e alvo XY."""
 
@@ -468,46 +469,56 @@ class MazeTask:
         dt: float = 0.01,
         speed_limit: float = 100.0,
         agent_radius: float = 0.0,
-        t_ms: Sequence[int] = np.arange(-50, 451),   # grade desejada, em ms
+        t_ms: Sequence[int] = np.arange(-50, 451),  # grade desejada, em ms
         use_maze_ids: Optional[Sequence[int]] = None,
         use_versions: Optional[Sequence[int]] = None,
         go_cue_at_zero: bool = True,
         add_xy_noise: float = 0.0,
     ):
-        self.dataset_name  = "MazeWorld2D"
-        self.n_timesteps   = int(n_timesteps)
-        self.dt            = float(dt)
-        self.speed_limit   = float(speed_limit)
-        self.agent_radius  = float(agent_radius)
-        self.coupled_env   = True
-        self.state_label   = "xy"
+        self.dataset_name = "MazeWorld2D"
+        self.n_timesteps = int(n_timesteps)
+        self.dt = float(dt)
+        self.speed_limit = float(speed_limit)
+        self.agent_radius = float(agent_radius)
+        self.coupled_env = True
+        self.state_label = "xy"
         self.dynamic_noise = 0.0
 
+        # labels para o DataModule
+        self.input_labels = [
+            "tx_norm", "ty_norm", "go",
+            "phase_init", "phase_target", "phase_delay", "phase_move",
+            "maze_id"
+        ]
+        self.output_labels = ["vx", "vy"]  # ação do controlador (velocidade XY)
+
+        # spaces de observação/ação/contexto
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
         self.action_space      = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
         self.context_inputs    = spaces.Box(low=-np.inf, high=np.inf, shape=(0,), dtype=np.float32)
 
-        self.loss_func = nn.MSELoss()
+        # loss compatível com o wrapper (usa dicionário com "controlled" vs "targets")
+        self.loss_func = RandomTargetLoss(position_loss=nn.MSELoss(), pos_weight=1.0, act_weight=0.0)
 
-        export_dir          = Path(export_dir)
+        export_dir = Path(export_dir)
         with open(export_dir / "mazes.json", "r", encoding="utf-8") as f:
             self.mazes = json.load(f)
-        self.traj_npz       = np.load(export_dir / "traj_means.npz")
+        self.traj_npz = np.load(export_dir / "traj_means.npz")
 
-        self.use_maze_ids   = set(use_maze_ids) if use_maze_ids is not None else None
-        self.use_versions   = set(use_versions) if use_versions is not None else None
-        self.keys           = self._collect_valid_keys()
-        any_k               = next(iter(self.keys))
-        self.t_ms_export    = self.traj_npz[f"{any_k}_t_ms"].astype(int)
-        self.t_ms           = np.asarray(t_ms, dtype=int)
+        self.use_maze_ids = set(use_maze_ids) if use_maze_ids is not None else None
+        self.use_versions = set(use_versions) if use_versions is not None else None
+        self.keys = self._collect_valid_keys()  # lista de strings "maze{mid}_ver{ver}"
+        any_k = next(iter(self.keys))
+        self.t_ms_export = self.traj_npz[f"{any_k}_t_ms"].astype(int)
+        self.t_ms = np.asarray(t_ms, dtype=int)
         self.go_cue_at_zero = bool(go_cue_at_zero)
-        self.add_xy_noise   = float(add_xy_noise)
+        self.add_xy_noise = float(add_xy_noise)
 
         # estado interno
-        self._pos        = None     # (B,2)
-        self._goal       = None     # (B,2)
-        self._rects      = None     # barreiras do maze corrente
-        self._cur_key    = None     # "maze{mid}_ver{ver}"
+        self._pos = None     # (B,2)
+        self._goal = None    # (B,2)
+        self._rects = None   # barreiras do maze corrente
+        self._cur_key = None # "maze{mid}_ver{ver}"
         self._terminated = False
 
         # se n_timesteps não bate com len(t_ms), force T = len(t_ms)
@@ -526,6 +537,7 @@ class MazeTask:
     def _rects_from_json(maze_dict):
         rects = []
         for cx, cy, hw, hh in maze_dict.get("barriers", []):
+            cx = float(cx); cy = float(cy); hw = float(hw); hh = float(hh)
             xmin, xmax = cx - hw, cx + hw
             ymin, ymax = cy - hh, cy + hh
             rects.append([xmin, xmax, ymin, ymax])
@@ -578,8 +590,6 @@ class MazeTask:
         Y_src = np.asarray(Y_src, dtype=np.float32)
         t_src = np.asarray(t_src, dtype=np.float32)
         t_dst = np.asarray(t_dst, dtype=np.float32)
-
-        # interp 1D; para fora do suporte, segura borda
         x_al = np.interp(t_dst, t_src, X_src, left=X_src[0], right=X_src[-1]).astype(np.float32)
         y_al = np.interp(t_dst, t_src, Y_src, left=Y_src[0], right=Y_src[-1]).astype(np.float32)
         return x_al, y_al
@@ -608,7 +618,8 @@ class MazeTask:
         self._goal = np.tile(np.array([Xr[-1], Yr[-1]], np.float32), (batch_size, 1))
 
         obs = torch.from_numpy(self._pos).float()
-        info = {"states": {"xy": obs, "joint": None}}
+        joint_state = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)  # (B,0)
+        info = {"states": {"xy": obs, "joint": joint_state}}
         return obs, info
 
     def step(self, action, inputs):
@@ -621,17 +632,18 @@ class MazeTask:
 
         self._pos = new_pos
         obs = torch.from_numpy(self._pos).float()
+        joint_state = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)  # (B,0)
+        info = {"states": {"xy": obs, "joint": joint_state}}
+        reward = None
         terminated = False
         truncated = False
-        info = {"states": {"xy": obs, "joint": None}}
-        reward = None
         return obs, reward, terminated, truncated, info
-    
+
     def generate_dataset(self, n_samples: int):
         rng = np.random.default_rng()
         T = self.n_timesteps
         t = self.t_ms  # vetor de tempo (ms) do próprio ambiente, len == T
-    
+
         # Canais: [0]=tx_norm, [1]=ty_norm, [2]=go,
         #         [3]=phase_init, [4]=phase_target, [5]=phase_delay, [6]=phase_move,
         #         [7]=maze_id (constante no trial)
@@ -639,70 +651,63 @@ class MazeTask:
         inputs  = np.zeros((n_samples, T, C), dtype=np.float32)
         targets = np.zeros((n_samples, T, 2), dtype=np.float32)
         ics     = np.zeros((n_samples, 2), dtype=np.float32)
-        conds   = np.zeros((n_samples, 2), dtype=np.int32)   # (maze_id, ver)
-        extras  = []
-    
+        conds   = np.zeros((n_samples, 2), dtype=np.int32)  # (maze_id, ver)
+
+        # buffers numéricos para "extra"
+        target_on_all, delay_end_all, go_all, max_abs_all = [], [], [], []
+
         for i in range(n_samples):
             # --- escolhe um maze ---
             key, _maze_dict = self._sample_key(rng)
             X = self.traj_npz[f"{key}_X"].astype(np.float32)
             Y = self.traj_npz[f"{key}_Y"].astype(np.float32)
             t_src = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
-    
+
             # --- alinha para a grade t ---
             Xr, Yr = self._align_traj(X, Y, t_src=t_src, t_dst=t)
-    
+
             # normalização global para os canais de entrada (apenas visual/escala)
             max_abs = max(1e-6, float(np.nanmax(np.abs(np.stack([Xr, Yr], axis=-1)))))
             Xn = Xr / max_abs
             Yn = Yr / max_abs
-    
+
             # posições de interesse
-            p0   = np.array([Xr[0],   Yr[0]], dtype=np.float32)     # start
-            p0_n = np.array([Xn[0],   Yn[0]], dtype=np.float32)     # start (norm.)
-            goal = np.array([Xr[-1],  Yr[-1]], dtype=np.float32)    # alvo final
+            p0   = np.array([Xr[0],   Yr[0]], dtype=np.float32)  # start
+            p0_n = np.array([Xn[0],   Yn[0]], dtype=np.float32)  # start (norm.)
+            goal = np.array([Xr[-1],  Yr[-1]], dtype=np.float32) # alvo final
             goal_n = np.array([Xn[-1], Yn[-1]], dtype=np.float32)
-    
+
             # --- agenda das fases (índices, sem overlap) ---
-            # target_on_idx  < delay_end_idx  < go_idx
-            # deixe janelas razoáveis; ajuste os ranges conforme seu t
             target_on_idx = int(rng.integers(low=max(5, T//10), high=min(T//4, T-200)))
             delay_len     = int(rng.integers(low=30, high=90))
             delay_end_idx = min(T-2, target_on_idx + delay_len)
-            go_idx        = delay_end_idx  # go logo após delay (poderia ter outra amostra se quiser)
+            go_idx        = delay_end_idx
             move_idx      = go_idx
-    
+
             # --- fases one-hot ---
-            phase_init   = np.zeros(T, np.float32); phase_init[:target_on_idx]     = 1.0
+            phase_init   = np.zeros(T, np.float32); phase_init[:target_on_idx]           = 1.0
             phase_target = np.zeros(T, np.float32); phase_target[target_on_idx:delay_end_idx] = 1.0
-            phase_delay  = np.zeros(T, np.float32); phase_delay[delay_end_idx:go_idx]         = 1.0
-            phase_move   = np.zeros(T, np.float32); phase_move[move_idx:]                    = 1.0
-    
-            # --- canal go (só na fase move) ---
+            phase_delay  = np.zeros(T, np.float32); phase_delay[delay_end_idx:go_idx]    = 1.0
+            phase_move   = np.zeros(T, np.float32); phase_move[move_idx:]                = 1.0
+
+            # --- canal go ---
             go = np.zeros(T, np.float32); go[move_idx:] = 1.0
-    
+
             # --- entradas tx,ty por fase ---
-            # INIT   : variáveis da task disponíveis (cursor/start) -> p0
-            # TARGET : alvo visível (goal constante)
-            # DELAY  : continua visível (goal constante)
-            # MOVE   : pode manter goal constante (a rede já deve “seguir” o target via loss)
             tx = np.zeros(T, np.float32); ty = np.zeros(T, np.float32)
             tx[phase_init > 0.5]   = p0_n[0];   ty[phase_init > 0.5]   = p0_n[1]
             tx[phase_target > 0.5] = goal_n[0]; ty[phase_target > 0.5] = goal_n[1]
             tx[phase_delay > 0.5]  = goal_n[0]; ty[phase_delay > 0.5]  = goal_n[1]
             tx[phase_move > 0.5]   = goal_n[0]; ty[phase_move > 0.5]   = goal_n[1]
-    
+
             # --- TARGETS (o que o modelo deve produzir) ---
-            # Sem movimento até o go: manter p0 até go_idx,
-            # depois “tocar” a trajetória do labirinto (Xr, Yr) a partir do início.
             tgt_xy = np.tile(p0[None, :], (T, 1))  # tudo em p0
             L = T - move_idx
             if L > 0:
-                # encaixa a trajetória desde o começo em move_idx...
                 segX = Xr[:L]; segY = Yr[:L]
                 tgt_xy[move_idx:, 0] = segX
                 tgt_xy[move_idx:, 1] = segY
-    
+
             # --- escreve tensores nos buffers ---
             inputs[i, :, 0] = tx
             inputs[i, :, 1] = ty
@@ -711,28 +716,37 @@ class MazeTask:
             inputs[i, :, 4] = phase_target
             inputs[i, :, 5] = phase_delay
             inputs[i, :, 6] = phase_move
-    
+
             mid = int(key.split("_")[0].replace("maze", ""))
             ver = int(key.split("_")[1].replace("ver", ""))
             inputs[i, :, 7] = float(mid)  # opcional (id bruto)
-    
+
             targets[i] = tgt_xy
             ics[i]     = p0
             conds[i]   = np.array([mid, ver], dtype=np.int32)
-            extras.append(dict(key=key,
-                               target_on_idx=int(target_on_idx),
-                               delay_end_idx=int(delay_end_idx),
-                               go_idx=int(go_idx),
-                               max_abs=float(max_abs)))
-    
+
+            # guarda para "extra"
+            target_on_all.append(target_on_idx)
+            delay_end_all.append(delay_end_idx)
+            go_all.append(go_idx)
+            max_abs_all.append(max_abs)
+
+        # "extra" estritamente numérico (HDF5-friendly)
+        extra = np.column_stack([
+            np.asarray(target_on_all, dtype=np.int32),
+            np.asarray(delay_end_all, dtype=np.int32),
+            np.asarray(go_all,        dtype=np.int32),
+            np.asarray(max_abs_all,   dtype=np.float32),
+        ]).astype(np.float32)  # (N,4)
+
         dataset_dict = dict(
             ics           = ics,
             inputs        = inputs,                           # [tx_n,ty_n,go,init,target,delay,move,maze_id]
             inputs_to_env = np.zeros((n_samples, T, 0), dtype=np.float32),  # paredes ficam no ambiente
-            targets       = targets,                          # [x,y] — sem movimento até go, depois trajetória
+            targets       = targets,                          # [x,y] — hold até go, depois trajetória
             true_inputs   = inputs.copy(),
             conds         = conds,                            # (maze_id, version)
-            extra         = np.array(extras, dtype=object).reshape(-1, 1),
+            extra         = extra,                            # (N,4) float32
         )
         extra_dict = {}
         return dataset_dict, extra_dict
