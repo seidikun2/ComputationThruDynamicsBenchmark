@@ -302,40 +302,51 @@ class MazeTask:
 
     # ---------- API esperada pelo wrapper ----------
     def reset(self, batch_size: int = 1, options: Optional[dict] = None):
-        rng                   = np.random.default_rng()
-        self._terminated      = False
-
-        # device alvo (se passado via wrapper)
-        target_device         = None
-        if options is not None:
-            target_device     = options.get("device", None)
-
-        # escolhe UM maze/versão e guarda para o episódio
-        key, maze_dict        = self._sample_key(rng)
-        self._cur_key         = key
-        rects_np              = self._rects_from_json(maze_dict)
-
-        X                     = self.traj_npz[f"{key}_X"].astype(np.float32)
-        Y                     = self.traj_npz[f"{key}_Y"].astype(np.float32)
-        t                     = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
-        Xr, Yr                = self._align_traj(X, Y, t_src=t, t_dst=self.t_ms)
-
-        p0_np                 = np.array([Xr[0], Yr[0]], dtype=np.float32)
-
-        # estado interno como tensor (no device certo)
-        dev                   = torch.device(target_device) if target_device is not None else torch.device("cpu")
-        self._pos_t           = torch.as_tensor(p0_np, dtype=torch.float32, device=dev).expand(batch_size, 2).clone()
-        self._goal_t          = torch.as_tensor([Xr[-1], Yr[-1]], dtype=torch.float32, device=dev).expand(batch_size, 2).clone()
-        if len(rects_np) > 0:
-            self._rects_t     = torch.as_tensor(rects_np, dtype=torch.float32, device=dev)  # (R,4)
+        rng                    = np.random.default_rng()
+        self._terminated       = False
+      
+        # --- device alvo (CPU/GPU) ---
+        if options is not None and options.get("device", None) is not None:
+            dev                = torch.device(options["device"])
+        elif options is not None and isinstance(options.get("ic_state", None), torch.Tensor):
+            dev                = options["ic_state"].device
         else:
-            self._rects_t     = None
-
-        # saída
-        obs                   = self._pos_t
-        joint_state           = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)  # (B,0)
-        info                  = {"states": {"xy": obs, "joint": joint_state}}
+            dev                = torch.device("cpu")
+      
+        # --- escolhe UM maze/versão e guarda para o episódio ---
+        key, maze_dict         = self._sample_key(rng)
+        self._cur_key          = key
+      
+        # --- barreiras -> tensor no device ---
+        rects_np               = self._rects_from_json(maze_dict)
+        self._rects_t          = (torch.as_tensor(rects_np, dtype=torch.float32, device=dev)
+                                  if len(rects_np) > 0 else None)
+      
+        # --- carrega e alinha trajetória para a grade t_ms ---
+        X                      = self.traj_npz[f"{key}_X"].astype(np.float32)
+        Y                      = self.traj_npz[f"{key}_Y"].astype(np.float32)
+        t                      = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
+        Xr, Yr                 = self._align_traj(X, Y, t_src=t, t_dst=self.t_ms)
+      
+        # --- estado inicial e goal como tensores no device ---
+        p0_t                   = torch.tensor([Xr[0],  Yr[0]],  dtype=torch.float32, device=dev)
+        goal_t                 = torch.tensor([Xr[-1], Yr[-1]], dtype=torch.float32, device=dev)
+        p0_t                   = p0_t.expand(batch_size, 2).clone()
+        goal_t                 = goal_t.expand(batch_size, 2).clone()
+      
+        # --- empurra o início para fora das barreiras se necessário ---
+        p0_t                   = self._resolve_collision_torch(p0_t)
+      
+        # --- grava estado interno ---
+        self._pos_t            = p0_t
+        self._goal_t           = goal_t
+      
+        # --- saída para o wrapper ---
+        obs                    = self._pos_t
+        joint_state            = torch.zeros((batch_size, 0), dtype=obs.dtype, device=obs.device)
+        info                   = {"states": {"xy": obs, "joint": joint_state}}
         return obs, info
+
 
     def _resolve_collision_torch(self, pos: torch.Tensor) -> torch.Tensor:
         """Empurra pontos (B,2) para fora de retângulos (R,4) usando menor penetração."""
