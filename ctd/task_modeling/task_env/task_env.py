@@ -384,20 +384,17 @@ class RandomTarget(Environment):
             "goal":         self.goal if self.differentiable else self.detach(self.goal),
         }
         return obs, info
+    
+    
 class MazeTask:
     """Ambiente 2D com paredes retangulares (AABB) e alvo XY."""
 
     def __init__(self, 
-                 export_dir: Union[str, Path], 
-                 n_timesteps: int, 
-                 dt: float = 0.01, 
-                 speed_limit: float = 100.0, 
-                 agent_radius: float = 0.0, 
-                 t_ms: Sequence[int] = np.arange(-50, 451),  # grade desejada, em ms
-                 use_maze_ids: Optional[Sequence[int]] = None,  
-                 use_versions: Optional[Sequence[int]] = None,
-                 go_cue_at_zero: bool = True, 
-                 add_xy_noise: float = 0.0,):
+                 export_dir, n_timesteps, dt=0.01, speed_limit=100.0,
+                 agent_radius=0.0, t_ms=np.arange(-50, 451),
+                 use_maze_ids=None, use_versions=None,
+                 go_cue_at_zero=True, add_xy_noise=0.0):
+        
         self.dataset_name       = "MazeWorld2D"
         self.n_timesteps        = int(n_timesteps)
         self.dt                 = float(dt)
@@ -406,6 +403,9 @@ class MazeTask:
         self.coupled_env        = True
         self.state_label        = "xy"
         self.dynamic_noise      = 0.0
+
+        # labels p/ DataModule
+        self.output_labels      = ["x", "y"]  # targets = posição XY
 
         # spaces de observação/ação/contexto
         self.observation_space  = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
@@ -429,15 +429,15 @@ class MazeTask:
         self.go_cue_at_zero     = bool(go_cue_at_zero)
         self.add_xy_noise       = float(add_xy_noise)
 
-        # === NOVO: lista ordenada de ids de maze (para one-hot) ===
+        # === ids de maze (para one-hot) ===
         self._maze_ids_sorted   = sorted({int(k.split("_")[0].replace("maze", "")) for k in self.keys})
 
-        # === NOVO: rótulos dos inputs (básicos + one-hot do maze) ===
-        self.base_input_labels  = ["tx_norm", "ty_norm", "context", "stim", "response"]
+        # === rótulos dos inputs: [tx_norm, ty_norm, response] + one-hot do maze ===
+        self.base_input_labels  = ["tx_norm", "ty_norm", "response"]
         self.maze_labels        = [f"maze_{mid}" for mid in self._maze_ids_sorted]
         self.input_labels       = self.base_input_labels + self.maze_labels
 
-        # estado interno (tensors quando em rollout)
+        # estado interno (tensors durante rollout)
         self._pos_t             = None    # (B,2)
         self._goal_t            = None    # (B,2)
         self._rects_t           = None    # (R,4)
@@ -495,7 +495,7 @@ class MazeTask:
     def _sample_key(self, rng):
         key                   = rng.choice(self.keys)
         mid                   = int(key.split("_")[0].replace("maze", ""))
-        ver                   = int(key.split("_")[1].replace("ver", ""))
+        ver                   = int(key.split("_")[1].replace("ver",  ""))
         maze_json_key         = f"{mid}__{ver}"
         return key, self.mazes[maze_json_key]
 
@@ -563,7 +563,6 @@ class MazeTask:
         if self._rects_t is None:
             return pos
 
-        # (B,2) -> (B,1) broadcast
         x, y                 = pos[:, 0].unsqueeze(1), pos[:, 1].unsqueeze(1)   # (B,1)
         xmin, xmax           = self._rects_t[:, 0], self._rects_t[:, 1]         # (R,)
         ymin, ymax           = self._rects_t[:, 2], self._rects_t[:, 3]         # (R,)
@@ -573,26 +572,24 @@ class MazeTask:
         if not inside.any():
             return pos
 
-        dx_left              = (x - (xmin - ar)).abs()               # (B,R)
+        dx_left              = (x - (xmin - ar)).abs()
         dx_right             = ((xmax + ar) - x).abs()
         dy_bot               = (y - (ymin - ar)).abs()
         dy_top               = ((ymax + ar) - y).abs()
 
         d                    = torch.stack([dx_left, dx_right, dy_bot, dy_top], dim=-1)  # (B,R,4)
-        # invalida distâncias de retângulos nos quais o ponto não está dentro
         d[~inside.unsqueeze(-1).expand_as(d)] = float("inf")
 
-        # argmin em (R,4) por batch
         B, R, _              = d.shape
-        flat_idx             = d.view(B, -1).argmin(dim=1)        # (B,)
-        which_r              = flat_idx // 4                      # (B,)
-        which_f              = flat_idx % 4                       # (B,)
+        flat_idx             = d.view(B, -1).argmin(dim=1)
+        which_r              = flat_idx // 4
+        which_f              = flat_idx % 4
 
         x_new, y_new         = pos[:, 0].clone(), pos[:, 1].clone()
-        mask0                = (which_f == 0)                     # left
-        mask1                = (which_f == 1)                     # right
-        mask2                = (which_f == 2)                     # bottom
-        mask3                = (which_f == 3)                     # top
+        mask0                = (which_f == 0)  # left
+        mask1                = (which_f == 1)  # right
+        mask2                = (which_f == 2)  # bottom
+        mask3                = (which_f == 3)  # top
         if mask0.any():
             x_new[mask0]     = (xmin[which_r[mask0]] - ar)
         if mask1.any():
@@ -607,7 +604,7 @@ class MazeTask:
     def step(self, action, inputs, endpoint_load=None):
         """
         action:        torch.Tensor (B,2)
-        inputs:        torch.Tensor (B,C)  -> canais: [tx,ty,context,stim,response,maze_onehot...]
+        inputs:        torch.Tensor (B,C)  -> canais: [tx,ty,response,maze_onehot...]
         endpoint_load: torch.Tensor | None (B,2)  -> ignorado aqui
         """
         a           = self._clamp_norm_torch(action, self.speed_limit)
@@ -629,15 +626,16 @@ class MazeTask:
         T                   = self.n_timesteps
         t                   = self.t_ms
 
-        # Canais: [tx_norm, ty_norm, context, stim, response] + one-hot do maze
+        # Canais: [tx_norm, ty_norm, response] + one-hot do maze
         n_mazes             = len(self._maze_ids_sorted)
-        C                   = 5 + n_mazes
+        C                   = 3 + n_mazes
 
         inputs              = np.zeros((n_samples, T, C), dtype=np.float32)
         targets             = np.zeros((n_samples, T, 2), dtype=np.float32)
         ics                 = np.zeros((n_samples, 2), dtype=np.float32)
         conds               = np.zeros((n_samples, 2), dtype=np.int32)  # (maze_id, ver)
 
+        # buffers p/ "extra" (mantemos 4 colunas por compatibilidade)
         target_on_all, stim_off_all, resp_on_all, max_abs_all = [], [], [], []
 
         for i in range(n_samples):
@@ -659,53 +657,46 @@ class MazeTask:
             goal              = np.array([Xr[-1],  Yr[-1]], dtype=np.float32)
             goal_n            = np.array([Xn[-1],  Yn[-1]], dtype=np.float32)
 
-            # --- agenda das fases (sem overlap) ---
+            # agenda mínima: só RESPONSE (go) — segura em p0 até response_on_idx
+            # (mantemos target_on_idx e stim_off_idx somente para preencher 'extra')
             target_on_idx     = int(rng.integers(low=max(5, T//10), high=min(T//4, T-200)))
-            stim_len          = int(rng.integers(low=40, high=120))
-            stim_off_idx      = min(T-2, target_on_idx + stim_len)
+            stim_off_idx      = target_on_idx  # sem 'stim', igualamos ao target_on_idx
             response_on_idx   = int(rng.integers(low=stim_off_idx + 20, high=min(T-2, stim_off_idx + 200)))
 
-            # one-hots de fase
-            phase_context     = np.zeros(T, np.float32); phase_context[:target_on_idx]             = 1.0
-            phase_stim        = np.zeros(T, np.float32); phase_stim[target_on_idx:stim_off_idx]    = 1.0
-            phase_response    = np.zeros(T, np.float32); phase_response[response_on_idx:]          = 1.0
+            # canal 'response' (go)
+            response          = np.zeros(T, np.float32); response[response_on_idx:] = 1.0
 
-            # --- entradas tx,ty por fase ---
-            # regra: alvo só aparece em Stim; fora disso, volta ao contexto
+            # entradas tx,ty: p0 antes do response; goal após o response
             tx = np.zeros(T, np.float32); ty = np.zeros(T, np.float32)
-            tx[phase_context  > 0.5] = p0_n[0];     ty[phase_context  > 0.5] = p0_n[1]
-            tx[phase_stim     > 0.5] = goal_n[0];   ty[phase_stim     > 0.5] = goal_n[1]
-            tx[phase_response > 0.5] = p0_n[0];     ty[phase_response > 0.5] = p0_n[1]
+            tx[:response_on_idx] = p0_n[0];     ty[:response_on_idx] = p0_n[1]
+            tx[response_on_idx:] = goal_n[0];   ty[response_on_idx:] = goal_n[1]
 
-            # --- TARGETS (segura p0 até response; depois segue a trajetória alinhada) ---
-            tgt_xy             = np.tile(p0[None, :], (T, 1))
-            L                  = T - response_on_idx
+            # targets XY: p0 até response; depois segue a trajetória alinhada
+            tgt_xy            = np.tile(p0[None, :], (T, 1))
+            L                 = T - response_on_idx
             if L > 0:
-                segX          = Xr[:L]
-                segY          = Yr[:L]
+                segX         = Xr[:L]; segY = Yr[:L]
                 tgt_xy[response_on_idx:, 0] = segX
                 tgt_xy[response_on_idx:, 1] = segY
 
-            # --- maze one-hot ---
-            mid                = int(key.split("_")[0].replace("maze", ""))
-            ver                = int(key.split("_")[1].replace("ver",  ""))
-            maze_onehot        = np.zeros(n_mazes, dtype=np.float32)
-            mid_idx            = self._maze_ids_sorted.index(mid)
+            # maze one-hot
+            mid               = int(key.split("_")[0].replace("maze", ""))
+            ver               = int(key.split("_")[1].replace("ver",  ""))
+            maze_onehot       = np.zeros(n_mazes, dtype=np.float32)
+            mid_idx           = self._maze_ids_sorted.index(mid)
             maze_onehot[mid_idx] = 1.0
 
-            # --- escreve nos tensores ---
-            inputs[i, :, 0]    = tx
-            inputs[i, :, 1]    = ty
-            inputs[i, :, 2]    = phase_context
-            inputs[i, :, 3]    = phase_stim
-            inputs[i, :, 4]    = phase_response
-            inputs[i, :, 5:5+n_mazes] = maze_onehot[None, :]  # (T,n_mazes) broadcast
+            # escreve nos tensores
+            inputs[i, :, 0]   = tx
+            inputs[i, :, 1]   = ty
+            inputs[i, :, 2]   = response
+            inputs[i, :, 3:3+n_mazes] = maze_onehot[None, :]  # (T,n_mazes) via broadcast
 
-            targets[i]         = tgt_xy
-            ics[i]             = p0
-            conds[i]           = np.array([mid, ver], dtype=np.int32)
+            targets[i]        = tgt_xy
+            ics[i]            = p0
+            conds[i]          = np.array([mid, ver], dtype=np.int32)
 
-            # extra (numérico e compacto)
+            # extra (mantido em 4 colunas por compatibilidade)
             target_on_all.append(target_on_idx)
             stim_off_all.append(stim_off_idx)
             resp_on_all.append(response_on_idx)
@@ -720,13 +711,12 @@ class MazeTask:
 
         dataset_dict = dict(
             ics            = ics,
-            inputs         = inputs,                           # [tx,ty,context,stim,response,maze_onehot...]
+            inputs         = inputs,                           # [tx,ty,response,maze_onehot...]
             inputs_to_env  = np.zeros((n_samples, T, 0), dtype=np.float32),
-            targets        = targets,                          # [x,y]: hold em p0 até response; depois segue XY
+            targets        = targets,                          # [x,y]
             true_inputs    = inputs.copy(),
             conds          = conds,                            # (maze_id, version)
             extra          = extra,                            # (target_on, stim_off, response_on, max_abs)
         )
         extra_dict = {}
         return dataset_dict, extra_dict
-
