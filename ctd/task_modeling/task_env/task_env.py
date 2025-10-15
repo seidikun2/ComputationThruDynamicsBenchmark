@@ -725,4 +725,4 @@ class MazeTask:
             extra            = extra,                            # (target_on, stim_off, response_on, max_abs)
         )
         extra_dict            = {}
-    return dataset_dict, extra_dict
+        return dataset_dict, extra_dict
