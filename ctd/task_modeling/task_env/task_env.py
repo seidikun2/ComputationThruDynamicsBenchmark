@@ -405,7 +405,7 @@ class MazeTask:
         self.dynamic_noise      = 0.0
 
         # labels p/ DataModule
-        self.output_labels      = ["x", "y"]  # targets = posição XY
+        self.output_labels      = ["vx", "vy"]  # targets = posição XY
 
         # spaces de observação/ação/contexto
         self.observation_space  = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
@@ -433,7 +433,7 @@ class MazeTask:
         self._maze_ids_sorted   = sorted({int(k.split("_")[0].replace("maze", "")) for k in self.keys})
 
         # === rótulos dos inputs: [tx_norm, ty_norm, response] + one-hot do maze ===
-        self.base_input_labels  = ["tx_norm", "ty_norm", "response"]
+        self.base_input_labels  = ["tx", "ty", "response"]
         self.maze_labels        = [f"maze_{mid}" for mid in self._maze_ids_sorted]
         self.input_labels       = self.base_input_labels + self.maze_labels
 
@@ -619,104 +619,110 @@ class MazeTask:
         terminated  = False
         truncated   = False
         return obs, reward, terminated, truncated, info
-
-    # ---------- geração de dados offline (permanece em NumPy) ----------
+    
     def generate_dataset(self, n_samples: int):
-        rng                 = np.random.default_rng()
-        T                   = self.n_timesteps
-        t                   = self.t_ms
-
-        # Canais: [tx_norm, ty_norm, response] + one-hot do maze
-        n_mazes             = len(self._maze_ids_sorted)
-        C                   = 3 + n_mazes
-
-        inputs              = np.zeros((n_samples, T, C), dtype=np.float32)
-        targets             = np.zeros((n_samples, T, 2), dtype=np.float32)
-        ics                 = np.zeros((n_samples, 2), dtype=np.float32)
-        conds               = np.zeros((n_samples, 2), dtype=np.int32)  # (maze_id, ver)
-
-        # buffers p/ "extra" (mantemos 4 colunas por compatibilidade)
+        rng                   = np.random.default_rng()
+        T                     = self.n_timesteps
+        t                     = self.t_ms
+    
+        # Canais: [tx, ty, response]     (apenas 3, sem normalização)
+        C                     = 3
+        inputs                = np.zeros((n_samples, T, C), dtype=np.float32)
+        targets               = np.zeros((n_samples, T, 2), dtype=np.float32)
+        ics                   = np.zeros((n_samples, 2), dtype=np.float32)
+        conds                 = np.zeros((n_samples, 2), dtype=np.int32)  # (maze_id, ver)
+    
+        # extra: guardamos índices de fase e, por comodidade, max_abs das trajetórias (se quiser usar em plots)
         target_on_all, stim_off_all, resp_on_all, max_abs_all = [], [], [], []
-
+    
         for i in range(n_samples):
             # --- escolhe um maze/versão ---
-            key, _maze_dict   = self._sample_key(rng)
-            X                 = self.traj_npz[f"{key}_X"].astype(np.float32)
-            Y                 = self.traj_npz[f"{key}_Y"].astype(np.float32)
-            t_src             = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
-            Xr, Yr            = self._align_traj(X, Y, t_src=t_src, t_dst=t)
-
-            # normalização para tx/ty
-            max_abs           = max(1e-6, float(np.nanmax(np.abs(np.stack([Xr, Yr], axis=-1)))))
-            Xn                = Xr / max_abs
-            Yn                = Yr / max_abs
-
-            # pontos chave
-            p0                = np.array([Xr[0],   Yr[0]], dtype=np.float32)
-            p0_n              = np.array([Xn[0],   Yn[0]], dtype=np.float32)
-            goal              = np.array([Xr[-1],  Yr[-1]], dtype=np.float32)
-            goal_n            = np.array([Xn[-1],  Yn[-1]], dtype=np.float32)
-
-            # agenda mínima: só RESPONSE (go) — segura em p0 até response_on_idx
-            # (mantemos target_on_idx e stim_off_idx somente para preencher 'extra')
-            target_on_idx     = int(rng.integers(low=max(5, T//10), high=min(T//4, T-200)))
-            stim_off_idx      = target_on_idx  # sem 'stim', igualamos ao target_on_idx
-            response_on_idx   = int(rng.integers(low=stim_off_idx + 20, high=min(T-2, stim_off_idx + 200)))
-
-            # canal 'response' (go)
-            response          = np.zeros(T, np.float32); response[response_on_idx:] = 1.0
-
-            # entradas tx,ty: p0 antes do response; goal após o response
-            tx = np.zeros(T, np.float32); ty = np.zeros(T, np.float32)
-            tx[:response_on_idx] = p0_n[0];     ty[:response_on_idx] = p0_n[1]
-            tx[response_on_idx:] = goal_n[0];   ty[response_on_idx:] = goal_n[1]
-
-            # targets XY: p0 até response; depois segue a trajetória alinhada
-            tgt_xy            = np.tile(p0[None, :], (T, 1))
-            L                 = T - response_on_idx
+            key, _maze_dict    = self._sample_key(rng)
+            X                  = self.traj_npz[f"{key}_X"].astype(np.float32)
+            Y                  = self.traj_npz[f"{key}_Y"].astype(np.float32)
+            t_src              = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
+            Xr, Yr             = self._align_traj(X, Y, t_src=t_src, t_dst=t)
+    
+            # magnitudes (só para utilidade de plot; NÃO normalizamos as entradas)
+            max_abs            = max(1e-6, float(np.nanmax(np.abs(np.stack([Xr, Yr], axis=-1)))))
+    
+            # pontos chave em XY absoluto
+            p0                 = np.array([Xr[0],   Yr[0]], dtype=np.float32)
+            goal               = np.array([Xr[-1],  Yr[-1]], dtype=np.float32)
+    
+            # --- agenda das fases (sem overlap) ---
+            # context: [0, target_on)
+            # stim:    [target_on, stim_off)
+            # delay:   [stim_off, response_on)
+            # response:[response_on, T)
+            target_on_idx      = int(rng.integers(low=max(5, T//10), high=min(T//4, T-200)))
+            stim_len           = int(rng.integers(low=200,        high=320))    # ~250 ms
+            stim_off_idx       = min(T-2, target_on_idx + stim_len)
+            delay_len_min      = 400
+            delay_len_max      = 1000
+            # garante response depois do delay (mas antes do fim)
+            response_on_idx    = int(min(T-2, stim_off_idx + rng.integers(low=delay_len_min, high=delay_len_max)))
+    
+            # saturação caso a janela estoure o episódio
+            response_on_idx    = max(response_on_idx, stim_off_idx + 1)
+            response_on_idx    = min(response_on_idx, T-1)
+    
+            # --- construir entradas (SEM normalização) ---
+            tx                 = np.empty(T, dtype=np.float32)
+            ty                 = np.empty(T, dtype=np.float32)
+            response           = np.ones(T, dtype=np.float32)             # 1 até o GO
+            response[response_on_idx:] = 0.0                              # 0 na fase de movimento (GO)
+    
+            # context
+            tx[:target_on_idx] = p0[0];  ty[:target_on_idx] = p0[1]
+            # stim (alvo absoluto)
+            tx[target_on_idx:stim_off_idx] = goal[0];  ty[target_on_idx:stim_off_idx] = goal[1]
+            # delay (volta ao estado de context)
+            tx[stim_off_idx:response_on_idx] = p0[0];  ty[stim_off_idx:response_on_idx] = p0[1]
+            # response (mantém como delay; o modelo deve “lembrar” o alvo)
+            tx[response_on_idx:] = p0[0];  ty[response_on_idx:] = p0[1]
+    
+            # --- TARGETS (hold em p0 até response; depois segue trajetória XY alinhada) ---
+            tgt_xy             = np.tile(p0[None, :], (T, 1))
+            L                  = T - response_on_idx
             if L > 0:
-                segX         = Xr[:L]; segY = Yr[:L]
+                segX           = Xr[:L]
+                segY           = Yr[:L]
                 tgt_xy[response_on_idx:, 0] = segX
                 tgt_xy[response_on_idx:, 1] = segY
-
-            # maze one-hot
-            mid               = int(key.split("_")[0].replace("maze", ""))
-            ver               = int(key.split("_")[1].replace("ver",  ""))
-            maze_onehot       = np.zeros(n_mazes, dtype=np.float32)
-            mid_idx           = self._maze_ids_sorted.index(mid)
-            maze_onehot[mid_idx] = 1.0
-
-            # escreve nos tensores
-            inputs[i, :, 0]   = tx
-            inputs[i, :, 1]   = ty
-            inputs[i, :, 2]   = response
-            inputs[i, :, 3:3+n_mazes] = maze_onehot[None, :]  # (T,n_mazes) via broadcast
-
-            targets[i]        = tgt_xy
-            ics[i]            = p0
-            conds[i]          = np.array([mid, ver], dtype=np.int32)
-
-            # extra (mantido em 4 colunas por compatibilidade)
+    
+            # --- escreve buffers ---
+            inputs[i, :, 0]    = tx
+            inputs[i, :, 1]    = ty
+            inputs[i, :, 2]    = response
+    
+            targets[i]         = tgt_xy
+            ics[i]             = p0
+    
+            mid                = int(key.split("_")[0].replace("maze", ""))  # para referência/plot
+            ver                = int(key.split("_")[1].replace("ver",  ""))  # para referência/plot
+            conds[i]           = np.array([mid, ver], dtype=np.int32)
+    
             target_on_all.append(target_on_idx)
             stim_off_all.append(stim_off_idx)
             resp_on_all.append(response_on_idx)
             max_abs_all.append(max_abs)
-
-        extra = np.column_stack([
-            np.asarray(target_on_all, dtype=np.int32),
-            np.asarray(stim_off_all, dtype=np.int32),
-            np.asarray(resp_on_all,  dtype=np.int32),
-            np.asarray(max_abs_all,  dtype=np.float32),
-        ]).astype(np.float32)  # (N,4)
-
-        dataset_dict = dict(
-            ics            = ics,
-            inputs         = inputs,                           # [tx,ty,response,maze_onehot...]
-            inputs_to_env  = np.zeros((n_samples, T, 0), dtype=np.float32),
-            targets        = targets,                          # [x,y]
-            true_inputs    = inputs.copy(),
-            conds          = conds,                            # (maze_id, version)
-            extra          = extra,                            # (target_on, stim_off, response_on, max_abs)
+    
+        extra                 = np.column_stack([
+                                 np.asarray(target_on_all, dtype=np.int32),
+                                 np.asarray(stim_off_all,  dtype=np.int32),
+                                 np.asarray(resp_on_all,   dtype=np.int32),
+                                 np.asarray(max_abs_all,   dtype=np.float32),
+                               ]).astype(np.float32)  # (N,4)
+    
+        dataset_dict          = dict(
+            ics              = ics,
+            inputs           = inputs,                           # [tx,ty,response] (absolutos)
+            inputs_to_env    = np.zeros((n_samples, T, 0), dtype=np.float32),
+            targets          = targets,                          # p0 até response; depois XY
+            true_inputs      = inputs.copy(),
+            conds            = conds,                            # (maze_id, version)
+            extra            = extra,                            # (target_on, stim_off, response_on, max_abs)
         )
-        extra_dict = {}
-        return dataset_dict, extra_dict
+        extra_dict            = {}
+    return dataset_dict, extra_dict
