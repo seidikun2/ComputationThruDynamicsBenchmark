@@ -384,7 +384,6 @@ class RandomTarget(Environment):
             "goal":         self.goal if self.differentiable else self.detach(self.goal),
         }
         return obs, info
-
 class MazeTask:
     """Ambiente 2D com paredes retangulares (AABB) e alvo XY."""
 
@@ -408,11 +407,6 @@ class MazeTask:
         self.state_label        = "xy"
         self.dynamic_noise      = 0.0
 
-        # labels para o DataModule
-        self.input_labels       = ["tx_norm", "ty_norm", "go", "phase_init", "phase_target",
-                                   "phase_delay", "phase_move", "maze_id"]
-        self.output_labels      = ["vx", "vy"]  # ação do controlador (velocidade XY)
-
         # spaces de observação/ação/contexto
         self.observation_space  = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
         self.action_space       = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
@@ -428,21 +422,28 @@ class MazeTask:
 
         self.use_maze_ids       = set(use_maze_ids) if use_maze_ids is not None else None
         self.use_versions       = set(use_versions) if use_versions is not None else None
-        self.keys               = self._collect_valid_keys()  # lista de strings "maze{mid}_ver{ver}"
+        self.keys               = self._collect_valid_keys()  # lista "maze{mid}_ver{ver}"
         any_k                   = next(iter(self.keys))
         self.t_ms_export        = self.traj_npz[f"{any_k}_t_ms"].astype(int)
         self.t_ms               = np.asarray(t_ms, dtype=int)
         self.go_cue_at_zero     = bool(go_cue_at_zero)
         self.add_xy_noise       = float(add_xy_noise)
 
+        # === NOVO: lista ordenada de ids de maze (para one-hot) ===
+        self._maze_ids_sorted   = sorted({int(k.split("_")[0].replace("maze", "")) for k in self.keys})
+
+        # === NOVO: rótulos dos inputs (básicos + one-hot do maze) ===
+        self.base_input_labels  = ["tx_norm", "ty_norm", "context", "stim", "response"]
+        self.maze_labels        = [f"maze_{mid}" for mid in self._maze_ids_sorted]
+        self.input_labels       = self.base_input_labels + self.maze_labels
+
         # estado interno (tensors quando em rollout)
-        self._pos_t             = None    # (B,2) tensor
-        self._goal_t            = None    # (B,2) tensor
-        self._rects_t           = None    # (R,4) tensor [xmin,xmax,ymin,ymax]
-        self._cur_key           = None    # "maze{mid}_ver{ver}"
+        self._pos_t             = None    # (B,2)
+        self._goal_t            = None    # (B,2)
+        self._rects_t           = None    # (R,4)
+        self._cur_key           = None
         self._terminated        = False
 
-        # se n_timesteps não bate com len(t_ms), force T = len(t_ms)
         if self.n_timesteps    != len(self.t_ms):
             self.n_timesteps    = len(self.t_ms)
 
@@ -606,130 +607,126 @@ class MazeTask:
     def step(self, action, inputs, endpoint_load=None):
         """
         action:        torch.Tensor (B,2)
-        inputs:        torch.Tensor (B,C)  -> canais da task (tx,ty,go,...)
-        endpoint_load: torch.Tensor | None (B,2)  -> ignorado aqui (não usamos cargas)
+        inputs:        torch.Tensor (B,C)  -> canais: [tx,ty,context,stim,response,maze_onehot...]
+        endpoint_load: torch.Tensor | None (B,2)  -> ignorado aqui
         """
-        # clamp de velocidade no device atual
-        a                  = self._clamp_norm_torch(action, self.speed_limit)          # (B,2)
-        new_pos            = self._pos_t + self.dt * a                                 # (B,2)
-        new_pos            = self._resolve_collision_torch(new_pos)                    # colisão AABB
+        a           = self._clamp_norm_torch(action, self.speed_limit)
+        new_pos     = self._pos_t + self.dt * a
+        new_pos     = self._resolve_collision_torch(new_pos)
 
-        self._pos_t        = new_pos
-        obs                = self._pos_t
-        joint_state        = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)
-        info               = {"states": {"xy": obs, "joint": joint_state}}
-        reward             = None
-        terminated         = False
-        truncated          = False
+        self._pos_t = new_pos
+        obs         = self._pos_t
+        joint_state = torch.zeros((obs.shape[0], 0), dtype=obs.dtype, device=obs.device)
+        info        = {"states": {"xy": obs, "joint": joint_state}}
+        reward      = None
+        terminated  = False
+        truncated   = False
         return obs, reward, terminated, truncated, info
 
     # ---------- geração de dados offline (permanece em NumPy) ----------
     def generate_dataset(self, n_samples: int):
         rng                 = np.random.default_rng()
         T                   = self.n_timesteps
-        t                   = self.t_ms  # vetor de tempo (ms) do próprio ambiente, len == T
+        t                   = self.t_ms
 
-        # Canais: [0]=tx_norm, [1]=ty_norm, [2]=go, [3]=phase_init, [4]=phase_target,
-        #         [5]=phase_delay, [6]=phase_move, [7]=maze_id (constante no trial)
-        C                   = 8
+        # Canais: [tx_norm, ty_norm, context, stim, response] + one-hot do maze
+        n_mazes             = len(self._maze_ids_sorted)
+        C                   = 5 + n_mazes
+
         inputs              = np.zeros((n_samples, T, C), dtype=np.float32)
         targets             = np.zeros((n_samples, T, 2), dtype=np.float32)
         ics                 = np.zeros((n_samples, 2), dtype=np.float32)
         conds               = np.zeros((n_samples, 2), dtype=np.int32)  # (maze_id, ver)
 
-        target_on_all, delay_end_all, go_all, max_abs_all = [], [], [], []
+        target_on_all, stim_off_all, resp_on_all, max_abs_all = [], [], [], []
 
         for i in range(n_samples):
-            # --- escolhe um maze ---
+            # --- escolhe um maze/versão ---
             key, _maze_dict   = self._sample_key(rng)
             X                 = self.traj_npz[f"{key}_X"].astype(np.float32)
             Y                 = self.traj_npz[f"{key}_Y"].astype(np.float32)
             t_src             = self.traj_npz[f"{key}_t_ms"].astype(np.float32)
-
-            # --- alinha para a grade t ---
             Xr, Yr            = self._align_traj(X, Y, t_src=t_src, t_dst=t)
 
-            # normalização global para os canais de entrada (apenas visual/escala)
+            # normalização para tx/ty
             max_abs           = max(1e-6, float(np.nanmax(np.abs(np.stack([Xr, Yr], axis=-1)))))
             Xn                = Xr / max_abs
             Yn                = Yr / max_abs
 
-            # posições de interesse
-            p0                = np.array([Xr[0],   Yr[0]], dtype=np.float32)  # start
-            p0_n              = np.array([Xn[0],   Yn[0]], dtype=np.float32)  # start (norm.)
-            goal              = np.array([Xr[-1],  Yr[-1]], dtype=np.float32) # alvo final
+            # pontos chave
+            p0                = np.array([Xr[0],   Yr[0]], dtype=np.float32)
+            p0_n              = np.array([Xn[0],   Yn[0]], dtype=np.float32)
+            goal              = np.array([Xr[-1],  Yr[-1]], dtype=np.float32)
             goal_n            = np.array([Xn[-1],  Yn[-1]], dtype=np.float32)
 
-            # --- agenda das fases (índices, sem overlap) ---
+            # --- agenda das fases (sem overlap) ---
             target_on_idx     = int(rng.integers(low=max(5, T//10), high=min(T//4, T-200)))
-            delay_len         = int(rng.integers(low=30, high=90))
-            delay_end_idx     = min(T-2, target_on_idx + delay_len)
-            go_idx            = delay_end_idx
-            move_idx          = go_idx
+            stim_len          = int(rng.integers(low=40, high=120))
+            stim_off_idx      = min(T-2, target_on_idx + stim_len)
+            response_on_idx   = int(rng.integers(low=stim_off_idx + 20, high=min(T-2, stim_off_idx + 200)))
 
-            # --- fases one-hot ---
-            phase_init        = np.zeros(T, np.float32); phase_init[:target_on_idx]                = 1.0
-            phase_target      = np.zeros(T, np.float32); phase_target[target_on_idx:delay_end_idx] = 1.0
-            phase_delay       = np.zeros(T, np.float32); phase_delay[delay_end_idx:go_idx]         = 1.0
-            phase_move        = np.zeros(T, np.float32); phase_move[move_idx:]                     = 1.0
-
-            # --- canal go ---
-            go                = np.zeros(T, np.float32); go[move_idx:] = 1.0
+            # one-hots de fase
+            phase_context     = np.zeros(T, np.float32); phase_context[:target_on_idx]             = 1.0
+            phase_stim        = np.zeros(T, np.float32); phase_stim[target_on_idx:stim_off_idx]    = 1.0
+            phase_response    = np.zeros(T, np.float32); phase_response[response_on_idx:]          = 1.0
 
             # --- entradas tx,ty por fase ---
+            # regra: alvo só aparece em Stim; fora disso, volta ao contexto
             tx = np.zeros(T, np.float32); ty = np.zeros(T, np.float32)
-            tx[phase_init   > 0.5] = p0_n[0];   ty[phase_init   > 0.5] = p0_n[1]
-            tx[phase_target > 0.5] = goal_n[0]; ty[phase_target > 0.5] = goal_n[1]
-            tx[phase_delay  > 0.5] = goal_n[0]; ty[phase_delay  > 0.5] = goal_n[1]
-            tx[phase_move   > 0.5] = goal_n[0]; ty[phase_move   > 0.5] = goal_n[1]
+            tx[phase_context  > 0.5] = p0_n[0];     ty[phase_context  > 0.5] = p0_n[1]
+            tx[phase_stim     > 0.5] = goal_n[0];   ty[phase_stim     > 0.5] = goal_n[1]
+            tx[phase_response > 0.5] = p0_n[0];     ty[phase_response > 0.5] = p0_n[1]
 
-            # --- TARGETS (o que o modelo deve produzir) ---
-            tgt_xy            = np.tile(p0[None, :], (T, 1))  # tudo em p0
-            L                 = T - move_idx
+            # --- TARGETS (segura p0 até response; depois segue a trajetória alinhada) ---
+            tgt_xy             = np.tile(p0[None, :], (T, 1))
+            L                  = T - response_on_idx
             if L > 0:
-                segX         = Xr[:L]; segY = Yr[:L]
-                tgt_xy[move_idx:, 0] = segX
-                tgt_xy[move_idx:, 1] = segY
+                segX          = Xr[:L]
+                segY          = Yr[:L]
+                tgt_xy[response_on_idx:, 0] = segX
+                tgt_xy[response_on_idx:, 1] = segY
 
-            # --- escreve tensores nos buffers ---
-            inputs[i, :, 0]   = tx
-            inputs[i, :, 1]   = ty
-            inputs[i, :, 2]   = go
-            inputs[i, :, 3]   = phase_init
-            inputs[i, :, 4]   = phase_target
-            inputs[i, :, 5]   = phase_delay
-            inputs[i, :, 6]   = phase_move
+            # --- maze one-hot ---
+            mid                = int(key.split("_")[0].replace("maze", ""))
+            ver                = int(key.split("_")[1].replace("ver",  ""))
+            maze_onehot        = np.zeros(n_mazes, dtype=np.float32)
+            mid_idx            = self._maze_ids_sorted.index(mid)
+            maze_onehot[mid_idx] = 1.0
 
-            mid               = int(key.split("_")[0].replace("maze", ""))
-            ver               = int(key.split("_")[1].replace("ver", ""))
-            inputs[i, :, 7]   = float(mid)  # opcional (id bruto)
+            # --- escreve nos tensores ---
+            inputs[i, :, 0]    = tx
+            inputs[i, :, 1]    = ty
+            inputs[i, :, 2]    = phase_context
+            inputs[i, :, 3]    = phase_stim
+            inputs[i, :, 4]    = phase_response
+            inputs[i, :, 5:5+n_mazes] = maze_onehot[None, :]  # (T,n_mazes) broadcast
 
-            targets[i]        = tgt_xy
-            ics[i]            = p0
-            conds[i]          = np.array([mid, ver], dtype=np.int32)
+            targets[i]         = tgt_xy
+            ics[i]             = p0
+            conds[i]           = np.array([mid, ver], dtype=np.int32)
 
-            # guarda para "extra"
+            # extra (numérico e compacto)
             target_on_all.append(target_on_idx)
-            delay_end_all.append(delay_end_idx)
-            go_all.append(go_idx)
+            stim_off_all.append(stim_off_idx)
+            resp_on_all.append(response_on_idx)
             max_abs_all.append(max_abs)
 
-        # "extra" estritamente numérico (HDF5-friendly)
-        extra                = np.column_stack([
+        extra = np.column_stack([
             np.asarray(target_on_all, dtype=np.int32),
-            np.asarray(delay_end_all, dtype=np.int32),
-            np.asarray(go_all,        dtype=np.int32),
-            np.asarray(max_abs_all,   dtype=np.float32),
+            np.asarray(stim_off_all, dtype=np.int32),
+            np.asarray(resp_on_all,  dtype=np.int32),
+            np.asarray(max_abs_all,  dtype=np.float32),
         ]).astype(np.float32)  # (N,4)
 
-        dataset_dict         = dict(
+        dataset_dict = dict(
             ics            = ics,
-            inputs         = inputs,                           # [tx_n,ty_n,go,init,target,delay,move,maze_id]
-            inputs_to_env  = np.zeros((n_samples, T, 0), dtype=np.float32),  # paredes ficam no ambiente
-            targets        = targets,                          # [x,y] — hold até go, depois trajetória
+            inputs         = inputs,                           # [tx,ty,context,stim,response,maze_onehot...]
+            inputs_to_env  = np.zeros((n_samples, T, 0), dtype=np.float32),
+            targets        = targets,                          # [x,y]: hold em p0 até response; depois segue XY
             true_inputs    = inputs.copy(),
             conds          = conds,                            # (maze_id, version)
-            extra          = extra,                            # (N,4) float32
+            extra          = extra,                            # (target_on, stim_off, response_on, max_abs)
         )
-        extra_dict           = {}
+        extra_dict = {}
         return dataset_dict, extra_dict
+
